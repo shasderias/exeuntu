@@ -1,0 +1,303 @@
+# syntax=docker/dockerfile:1
+
+# Stage 1: Get the headless-shell (Chromium) build Shelley's release metadata
+# advertises for this platform, so it matches what Shelley upgrades to.
+FROM docker.io/library/ubuntu:24.04 AS chrome
+ARG TARGETARCH
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends ca-certificates curl jq && \
+	curl -fsSL --retry 5 --retry-all-errors -o /tmp/release.json https://boldsoftware.github.io/shelley/release.json && \
+	build=$(jq -ce --arg p "linux_$TARGETARCH" '.headless_shells[$p] // error("no headless_shells.\($p) in release.json")' /tmp/release.json) && \
+	version=$(jq -r .version <<<"$build") && \
+	url=$(jq -r .url <<<"$build") && \
+	[[ $url == https://github.com/boldsoftware/shelley/releases/download/headless-shell/v"${version#Chromium }"/* ]] && \
+	curl -fsSL --retry 5 --retry-all-errors -o /tmp/headless-shell.tar.gz "$url" && \
+	tar -xzf /tmp/headless-shell.tar.gz -C / --no-same-owner && \
+	[[ -x /headless-shell/headless-shell ]] && \
+	# Record the release, which the binary's --version can't show, for Shelley's version check.
+	sum=$(sha256sum /headless-shell/headless-shell | cut -d' ' -f1) && \
+	printf '%s\nsha256 %s\n' "$version" "$sum" > /headless-shell/headless-shell-version.txt
+
+# Build the guest-facing exeuntu helper.
+FROM docker.io/library/golang:1.27.4 AS exeuntu-cli
+ARG EXEUNTU_GIT_VERSION=unknown
+WORKDIR /src/exeuntu-cli
+COPY cli/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=mod -tags osusergo,netgo \
+        -ldflags "-X main.gitVersion=${EXEUNTU_GIT_VERSION} -extldflags=-static -s -w" \
+        -o /out/exeuntu .
+
+FROM ubuntu:24.04
+
+# Switch from dash to bash by default.
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+
+# Mini: stay minimized (no unminimize, man pages, or metapackages) and install
+# only what the exe.dev integrations, Shelley, and its browser need. Anything
+# cut here can be added back on a VM with `sudo unminimize` / `apt-get install`.
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirror://mirrors.ubuntu.com/mirrors.txt|' /etc/apt/sources.list && \
+	apt-get update && \
+	# Pull in all available security/bugfix updates for packages already
+	# in the base ubuntu:24.04 image. Without this we ship whatever was
+	# current when Canonical last rebuilt the base layer, which can be
+	# months behind (e.g. nginx Rift, CVE-2026-42945). The weekly cron
+	# rebuild + no-cache will keep this fresh going forward.
+	DEBIAN_FRONTEND=noninteractive apt-get -y \
+		-o Dpkg::Options::=--force-confold \
+		-o Dpkg::Options::=--force-confdef \
+		dist-upgrade && \
+	# Pre-configure debconf to avoid interactive prompts
+	echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections && \
+	DEBIAN_FRONTEND=noninteractive apt-get install -y \
+		ca-certificates curl ripgrep \
+		locales \
+		git jq vim-tiny lsof iproute2 less \
+		python3 python-is-python3 file \
+		psmisc sudo \
+		openssh-server openssh-client \
+		libcap2-bin unzip util-linux rsync \
+		iputils-ping netcat-openbsd \
+		systemd systemd-sysv \
+		# Mini: headless-shell links only libc, expat, nspr, and nss, and loads
+		# fontconfig; it needs none of upstream's GTK/X11/GBM stack.
+		libnss3 libnss3-tools libexpat1 libfontconfig1 fontconfig \
+		fonts-noto-color-emoji fonts-symbola \
+		dbus-user-session \
+		&& \
+		# Mini: locales instead of locales-all; generate the common UTF-8 locale.
+		locale-gen en_US.UTF-8 && \
+		# openssh-server generates host keys during package configuration.
+		# Do not bake those per-image private keys into exeuntu.
+		rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub && \
+		# Allow non-root users to use ping without sudo by granting CAP_NET_RAW
+		setcap cap_net_raw=+ep /usr/bin/ping && \
+	fc-cache -f -v && \
+	# Remove policy-rc.d so services can start normally (the base image includes this
+	# to prevent services from starting during build, but we run systemd at runtime)
+	rm -f /usr/sbin/policy-rc.d && \
+	# Mini: drop the package lists; run `sudo apt-get update` before installing.
+	rm -rf /var/lib/apt/lists/*
+
+# exe-init manages DNS directly; drop the unused systemd-resolved.
+RUN apt-get purge -y systemd-resolved
+
+COPY --from=exeuntu-cli /out/exeuntu /usr/local/bin/exeuntu
+
+# Configure systemd
+RUN rm -f /etc/systemd/system/multi-user.target.wants/console-setup.service \
+		/etc/systemd/system/multi-user.target.wants/ModemManager.service \
+		/etc/systemd/system/multi-user.target.wants/snapd.* \
+		/etc/systemd/system/multi-user.target.wants/unattended-upgrades.* \
+		/etc/systemd/system/multi-user.target.wants/ubuntu-advantage.service && \
+	systemctl mask -- getty.target \
+		fwupd.service \
+		fwupd-refresh.service \
+		fwupd-refresh.timer \
+		systemd-random-seed.service \
+		iscsid.socket \
+		dm-event.socket \
+		man-db.timer \
+		update-notifier-download.timer \
+		update-notifier-motd.timer \
+		atop-rotate.timer \
+		dpkg-db-backup.timer \
+		e2scrub_all.timer \
+		etc-resolv.conf.mount \
+		etc-hosts.mount \
+		etc-hostname.mount \
+		-.mount \
+		systemd-remount-fs.service \
+		systemd-sysusers.service \
+		systemd-update-done.service \
+		systemd-update-utmp.service \
+		systemd-journal-catalog-update.service \
+		modprobe@.service \
+		systemd-modules-load.service \
+		systemd-udevd.service \
+		systemd-udevd-control.service \
+		systemd-udevd-kernel.service \
+		systemd-udev-trigger.service \
+		systemd-udev-settle.service \
+		systemd-hwdb-update.service \
+		ubuntu-fan.service \
+		ldconfig.service \
+		unattended-upgrades.service \
+		lxd-installer.socket \
+	        console-getty.service \
+		keyboard-setup.service \
+		systemd-ask-password-console.path \
+		systemd-ask-password-wall.path \
+		ssh.socket \
+		ssh.service \
+		plymouth.service \
+		plymouth-start.service \
+		plymouth-quit.service \
+		plymouth-quit-wait.service \
+		plymouth-read-write.service \
+		plymouth-switch-root.service \
+		plymouth-switch-root-initramfs.service \
+		plymouth-halt.service \
+		plymouth-reboot.service \
+		plymouth-poweroff.service \
+		plymouth-kexec.service \
+		apt-daily-upgrade.timer \
+		apt-daily.timer \
+		plymouth-log.service && \
+	# systemd-logind is disabled but not masked. It's involved in populating the XDG runtime dir sockets... somehow
+	# Mini: disable only the units that exist; many come from packages mini cuts.
+	disable_existing() { for u; do if [[ -e /usr/lib/systemd/system/$u || -e /etc/systemd/system/$u ]]; then systemctl disable "$u"; fi; done; } && \
+	disable_existing getty.target systemd-logind.service \
+                   console-getty.service \
+		   atop.service \
+                   getty@.service \
+                   snapd.socket \
+		   motd-news.timer motd-news.service \
+		    apport.service apport-autoreport.timer apport-autoreport.path apport-forward.socket \
+		    snapd.snap-repair.timer snapd.snap-repair.service \
+		    udisks2.service \
+		   ufw.service \
+		   lvm2-lvmpolld.socket \
+                   systemd-ask-password-wall.service \
+                   systemd-ask-password-console.service \
+                   systemd-machine-id-commit.service \
+                   systemd-modules-load.service \
+                   systemd-sysctl.service \
+                   systemd-firstboot.service \
+                   systemd-udevd.service \
+                   systemd-udev-trigger.service \
+                   systemd-udev-settle.service \
+		   e2scrub_reap.service \
+		   systemd-update-utmp.service \
+		   atopacct.service \
+		   sysstat.service \
+                   systemd-hwdb-update.service \
+		   multipathd.service && \
+	mkdir -p /etc/systemd/system.conf.d && \
+    		echo '[Manager]' > /etc/systemd/system.conf.d/container-overrides.conf && \
+    		echo 'LogLevel=info' >> /etc/systemd/system.conf.d/container-overrides.conf && \
+    		echo 'LogTarget=console' >> /etc/systemd/system.conf.d/container-overrides.conf && \
+    		echo 'SystemCallArchitectures=native' >> /etc/systemd/system.conf.d/container-overrides.conf && \
+    		echo 'DefaultOOMPolicy=continue' >> /etc/systemd/system.conf.d/container-overrides.conf && \
+	mkdir -p /etc/systemd/journald.conf.d && \
+		echo '[Journal]' > /etc/systemd/journald.conf.d/persistent.conf && \
+		echo 'Storage=persistent' >> /etc/systemd/journald.conf.d/persistent.conf && \
+	systemctl set-default multi-user.target
+
+# Modify existing ubuntu user (UID 1000) to become exedev user
+RUN usermod -l exedev -c "exe.dev user" ubuntu && \
+	groupmod -n exedev ubuntu && \
+	mv /home/ubuntu /home/exedev && \
+	usermod -d /home/exedev exedev && \
+	usermod -aG sudo exedev && \
+	sed -i 's/^ubuntu:/exedev:/' /etc/subuid /etc/subgid && \
+	echo 'exedev ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
+	echo 'Defaults:exedev verifypw=any' >> /etc/sudoers && \
+	# Manually enable linger, this should autopopulate /run/user/1000
+	mkdir -p /var/lib/systemd/linger && \
+	touch /var/lib/systemd/linger/exedev
+
+# Bake /etc/fstab so systemd-growfs@-.service resizes the root filesystem on
+# first boot after the disk is grown.
+RUN echo '/dev/vda / ext4 defaults,x-systemd.growfs 0 1' > /etc/fstab
+
+# Stop systemd wiping /tmp at boot; that races non-systemd users of the system
+# that also run at boot.
+COPY tmpfiles-tmp.conf /etc/tmpfiles.d/tmp.conf
+
+COPY --chmod=644 fstrim-timer.conf /etc/systemd/system/fstrim.timer.d/exe.conf
+
+ENV EXEUNTU=1
+
+# https://github.com/trfore/docker-ubuntu2404-systemd/blob/main/Dockerfile suggests the following
+# might be useful?
+# STOPSIGNAL SIGRTMIN+3
+
+
+# Copy the self-contained Chrome bundle
+COPY --from=chrome /headless-shell /headless-shell
+ENV PATH="/usr/local/bin:/headless-shell:${PATH}"
+
+RUN mkdir -p /home/exedev /home/exedev/.config/shelley && \
+    chown exedev:exedev /home/exedev /home/exedev/.config /home/exedev/.config/shelley
+
+USER exedev
+
+WORKDIR /home/exedev
+
+# Update PATH in .bashrc to include .local/bin and set XDG_RUNTIME_DIR for systemd user services
+# XDG paths are not autopopulated despite the presense of libpam-systemd. Manually add them here.
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/exedev/.bashrc && \
+    echo 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"' >> /home/exedev/.bashrc && \
+    echo 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"' >> /home/exedev/.profile
+
+# Configure git to use 'main' as default branch name
+RUN git config --global init.defaultBranch main
+
+# Chromium blocks the compromised eMudhra intermediates only since
+# 156.0.8078.69 and 157.0.8103.20; distrust the root above them in exedev's
+# NSS database, which older builds honor too.
+RUN --mount=type=bind,source=distrust-emudhra.sh,target=/tmp/distrust-emudhra.sh \
+	bash /tmp/distrust-emudhra.sh && \
+	certutil -L -d sql:/home/exedev/.pki/nssdb | grep -q '^distrusted emSign ECC Root CA - G3  *p,p,p$'
+
+# Switch back to root to install systemd service
+USER root
+
+# Disable Ubuntu's default MOTD (the sudo hint, etc.)
+RUN rm -rf /etc/update-motd.d/* /etc/motd && touch /home/exedev/.hushlogin && chown exedev:exedev /home/exedev/.hushlogin
+
+# Add custom MOTD to exedev's .bashrc (ignores .hushlogin - we handle that ourselves)
+COPY motd-snippet.mini.bash /tmp/motd-snippet.bash
+RUN cat /tmp/motd-snippet.bash >> /home/exedev/.bashrc && rm /tmp/motd-snippet.bash
+
+# Create systemd socket and service for Shelley (socket activation).
+# The shelley binary itself is installed at vm creation.
+COPY shelley.socket /etc/systemd/system/shelley.socket
+COPY shelley.service /etc/systemd/system/shelley.service
+COPY tmpfiles-shelley.conf /etc/tmpfiles.d/shelley.conf
+RUN chmod 644 /etc/systemd/system/shelley.socket /etc/systemd/system/shelley.service && \
+    systemctl enable shelley.socket
+
+# Give git the identity exe.dev writes at VM creation (see
+# https://exe.dev/docs/git-identity), as system config so that anything in
+# ~/.gitconfig overrides it. git skips the include if the file is missing.
+RUN git config --system include.path /exe.dev/etc/gitconfig
+
+# Create systemd oneshot service for /exe.dev/setup script
+COPY exe-setup.service /etc/systemd/system/exe-setup.service
+RUN chmod 644 /etc/systemd/system/exe-setup.service && \
+    systemctl enable exe-setup.service
+
+# TODO(crawshaw/philip): This is called init so that exetini decides
+# this wrapper script is an init, and exec's it rather than forking it.
+# It would be better if you could indicate that via an env variable or something.
+COPY init-wrapper.sh /usr/local/bin/init
+
+# Copy Shelley instructions.
+COPY AGENTS.md /home/exedev/.config/shelley/AGENTS.md
+# Mini: append how to restore the tools mini leaves out.
+COPY AGENTS.mini.md /tmp/AGENTS.mini.md
+RUN cat /tmp/AGENTS.mini.md >> /home/exedev/.config/shelley/AGENTS.md && rm /tmp/AGENTS.mini.md && \
+    chown exedev:exedev /home/exedev/.config/shelley/AGENTS.md
+
+# Install xterm-ghostty terminfo for Ghostty terminal support
+COPY xterm-ghostty.terminfo /tmp/xterm-ghostty.terminfo
+RUN tic -x - < /tmp/xterm-ghostty.terminfo && rm /tmp/xterm-ghostty.terminfo
+
+# Empty the machine ID baked in by package configuration, so each VM built from
+# this image generates its own on first boot. A shared one defeats anything that
+# assumes machine IDs are unique, such as systemd's FixedRandomDelay=. Empty
+# rather than removed: systemd reads an absent /etc/machine-id as a first boot
+# and presets all units, re-enabling the ones disabled above. Keep this last, so
+# that no apt-get install bakes in a new ID.
+RUN : > /etc/machine-id && \
+	ln -sf /etc/machine-id /var/lib/dbus/machine-id
+
+# Expose the web server ports
+EXPOSE 8000 9999
+
+LABEL "exe.dev/login-user"="exedev"
+LABEL "exe.dev/install-shelley"="true"
+CMD ["/usr/local/bin/init"]
